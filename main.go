@@ -58,7 +58,7 @@ func parseSubjects() []Subject {
 }
 
 func getSubject(name string, sourceURLs []string) Subject {
-	fmt.Printf("--- Building Subject: %s ---\n", name)
+	log.Printf("--- Building Subject: %s ---\n", name)
 	subject := Subject{
 		Name:    name,
 		Commits: make(map[plumbing.Hash]*object.Commit),
@@ -77,7 +77,7 @@ func getSubject(name string, sourceURLs []string) Subject {
 		}
 	}
 	
-	fmt.Printf("Total unique commits for %s: %d\n", name, len(subject.Commits))
+	log.Printf("Total unique commits for %s: %d\n", name, len(subject.Commits))
 	return subject
 }
 
@@ -133,7 +133,7 @@ func getSource(rawURL string, subjectName string) (*Source, []*object.Commit) {
 		}
 	}
 
-	fmt.Printf("Processing source: %s (%d repos)\n", rawURL, len(repoURLs))
+	log.Printf("Processing source: %s (%d repos)\n", rawURL, len(repoURLs))
 	
 	var allCommits []*object.Commit
 	for _, repoURL := range repoURLs {
@@ -147,8 +147,6 @@ func getSource(rawURL string, subjectName string) (*Source, []*object.Commit) {
 }
 
 func getRepo(repoURL string, subjectName string, sourceUser string) (*git.Repository, []*object.Commit) {
-	fmt.Printf("  Cloning metadata for repo: %s\n", repoURL)
-	
 	repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
 		URL:        repoURL,
 		Filter:     packp.FilterBlobNone(),
@@ -184,7 +182,7 @@ func getRepo(repoURL string, subjectName string, sourceUser string) (*git.Reposi
 		return nil, nil
 	}
 
-	fmt.Printf("  Found %d commits in repo\n", len(commits))
+	log.Printf("  Found %d commits in repo %s\n", len(commits), repoURL)
 	return repo, commits
 }
 
@@ -233,7 +231,6 @@ func main() {
 	flag.Parse()
 
 	var subjects []Subject
-	
 	if *userFlag != "" {
 		subject := buildSubjectFromFlag(*userFlag)
 		subjects = []Subject{subject}
@@ -243,33 +240,6 @@ func main() {
 			log.Fatal("No subjects found")
 		}
 	}
-
-	for _, subject := range subjects {
-		if len(subject.Commits) == 0 {
-			log.Printf("No commits found for %s. Skipping output.", subject.Name)
-			continue
-		}
-
-		if *stdOut {
-			estimateSleepSchedule(&subject)
-		}
-		if *plotScatter {
-			outputFilename := fmt.Sprintf("%s_commits_scatter.png", subject.Name)
-			if err := plotCommitsScatter(&subject, outputFilename); err != nil {
-				log.Printf("Failed to save scatter plot for %s: %v", subject.Name, err)
-			} else {
-				fmt.Printf("Saved scatter plot to %s\n", outputFilename)
-			}
-		}
-		if *plotHisto {
-			outputFilename := fmt.Sprintf("%s_commits_histogram.png", subject.Name)
-			if err := plotCommitsHistogram(&subject, outputFilename); err != nil {
-				log.Printf("Failed to save histogram for %s: %v", subject.Name, err)
-			} else {
-				fmt.Printf("Saved histogram to %s\n", outputFilename)
-			}
-		}
-		fmt.Println("--------------------------------")
-	}
+	output(subjects, *stdOut, *plotScatter, *plotHisto)
 }
 

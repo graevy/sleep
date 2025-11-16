@@ -4,69 +4,68 @@ import (
 	"fmt"
 	"image/color"
 	"time"
+	"log"
+	"strings"
 
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 )
 
-// estimateSleepSchedule analyzes commits to find likely sleep windows
-func estimateSleepSchedule(subject *Subject) {
-	if len(subject.Commits) == 0 {
-		fmt.Printf("No commits to analyze for %s\n", subject.Name)
-		return
+func output(subjects []Subject, o bool, p bool, h bool) {
+	if len(subjects) == 0 {
+		log.Fatal("No subjects found")
 	}
 
-	// Build histogram of activity by hour
+	for _, subject := range subjects {
+		if len(subject.Commits) == 0 {
+			log.Printf("No commits found for %s. Skipping output.", subject.Name)
+			continue
+		}
+
+		if o {
+			if err := printSleepHisto(&subject); err != nil {
+				log.Printf("Failed to print sleep histogram for %s: %v", subject.Name, err)
+			}
+		}
+		if p {
+			outputFilename := fmt.Sprintf("%s_commits_scatter.png", subject.Name)
+			if err := plotCommitsScatter(&subject, outputFilename); err != nil {
+				log.Printf("Failed to save scatter plot for %s: %v", subject.Name, err)
+			} else {
+				fmt.Printf("Saved scatter plot to %s\n", outputFilename)
+			}
+		}
+		if h {
+			outputFilename := fmt.Sprintf("%s_commits_histogram.png", subject.Name)
+			if err := plotCommitsHistogram(&subject, outputFilename); err != nil {
+				log.Printf("Failed to save histogram for %s: %v", subject.Name, err)
+			} else {
+				fmt.Printf("Saved histogram to %s\n", outputFilename)
+			}
+		}
+		log.Println("--------------------------------")
+	}
+}
+
+func printSleepHisto(subject *Subject) error {
+	var maxi int
 	hourCounts := make([]int, 24)
 	for _, c := range subject.Commits {
 		t := c.Author.When
 		hour := t.Hour()
 		hourCounts[hour]++
-	}
-
-	// Find the longest consecutive sequence of low-activity hours
-	// Low activity = fewer than 5% of average hourly commits
-	totalCommits := len(subject.Commits)
-	avgPerHour := float64(totalCommits) / 24.0
-	threshold := int(avgPerHour * 0.05)
-	if threshold < 1 {
-		threshold = 1
-	}
-
-	var longestStart, longestLen int
-	currentStart, currentLen := -1, 0
-
-	for i := 0; i < 48; i++ { // Check twice around the clock to handle wrap-around
-		hour := i % 24
-		if hourCounts[hour] <= threshold {
-			if currentLen == 0 {
-				currentStart = hour
-			}
-			currentLen++
-			if currentLen > longestLen {
-				longestLen = currentLen
-				longestStart = currentStart
-			}
-		} else {
-			currentLen = 0
+		if hour > maxi {
+			maxi = hour
 		}
 	}
 
-	if longestLen >= 4 { // At least 4 hours of inactivity
-		sleepStart := longestStart
-		sleepEnd := (longestStart + longestLen) % 24
-		
-		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
-		fmt.Printf("Estimated sleep window: %02d:00 - %02d:00\n", sleepStart, sleepEnd)
-		fmt.Printf("Duration: ~%d hours\n", longestLen)
-		fmt.Printf("Based on %d commits\n", totalCommits)
-		fmt.Printf("Low-activity threshold: ≤%d commits/hour\n\n", threshold)
-	} else {
-		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
-		fmt.Printf("Unable to identify clear sleep window (no extended low-activity period)\n")
-		fmt.Printf("This may indicate irregular sleep patterns or insufficient data\n\n")
+	n := len(fmt.Sprintf("%d", maxi))
+	log.Printf("Sleep histogram for user %s:\n", subject.Name)
+	for hour, count := range hourCounts {
+		fmt.Printf("%02d:00 (%0*d): %s\n", hour, n, count, strings.Repeat("#", count))
 	}
+	return nil
 }
 
 // plotCommitsScatter creates a scatter plot of commit timestamps
@@ -201,4 +200,64 @@ func (dateTicks) Ticks(min, max float64) []plot.Tick {
 	ticks = append(ticks, plot.Tick{Value: max, Label: maxTime.Format("2006-01-02")})
 	return ticks
 }
+
+// analyzes commits to find likely sleep windows
+// pretty clumsy, might remove
+// func estimateSleepSchedule(subject *Subject) {
+// 	if len(subject.Commits) == 0 {
+// 		fmt.Printf("No commits to analyze for %s\n", subject.Name)
+// 		return
+// 	}
+//
+// 	// build histogram of activity by hour
+// 	hourCounts := make([]int, 24)
+// 	for _, c := range subject.Commits {
+// 		t := c.Author.When
+// 		hour := t.Hour()
+// 		hourCounts[hour]++
+// 	}
+//
+// 	// Find the longest consecutive sequence of low-activity hours
+// 	// Low activity = fewer than 5% of average hourly commits
+// 	totalCommits := len(subject.Commits)
+// 	avgPerHour := float64(totalCommits) / 24.0
+// 	threshold := int(avgPerHour * 0.05)
+// 	if threshold < 1 {
+// 		threshold = 1
+// 	}
+//
+// 	var longestStart, longestLen int
+// 	currentStart, currentLen := -1, 0
+//
+// 	for i := 0; i < 48; i++ { // Check twice around the clock to handle wrap-around
+// 		hour := i % 24
+// 		if hourCounts[hour] <= threshold {
+// 			if currentLen == 0 {
+// 				currentStart = hour
+// 			}
+// 			currentLen++
+// 			if currentLen > longestLen {
+// 				longestLen = currentLen
+// 				longestStart = currentStart
+// 			}
+// 		} else {
+// 			currentLen = 0
+// 		}
+// 	}
+//
+// 	if longestLen >= 4 { // At least 4 hours of inactivity
+// 		sleepStart := longestStart
+// 		sleepEnd := (longestStart + longestLen) % 24
+// 		
+// 		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
+// 		fmt.Printf("Estimated sleep window: %02d:00 - %02d:00\n", sleepStart, sleepEnd)
+// 		fmt.Printf("Duration: ~%d hours\n", longestLen)
+// 		fmt.Printf("Based on %d commits\n", totalCommits)
+// 		fmt.Printf("Low-activity threshold: ≤%d commits/hour\n\n", threshold)
+// 	} else {
+// 		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
+// 		fmt.Printf("Unable to identify clear sleep window (no extended low-activity period)\n")
+// 		fmt.Printf("This may indicate irregular sleep patterns or insufficient data\n\n")
+// 	}
+// }
 
