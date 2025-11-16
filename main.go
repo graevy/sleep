@@ -1,21 +1,5 @@
 package main
 
-// overall structure:
-// main() reads subjects.toml (getSubjects), looking to construct Subject structs
-// each Subject has Sources, e.g. "github.com/user", a place where repo(s) need to get cloned
-// getSubjects calls parseSource to get those repos. each common git host has its own API,
-// and this code is abstracted into api.go 
-// there's some hacky detectAPI() and an account->repos fetcher function for each API
-// recent-only commit logic is delegated to those fetcher functions
-// then, parseSource clones the actual repos 
-// the `blob:none` git-clone filter only clones commit metadata because we only want timestamps
-// then we must entity-resolve the user to check if they made the commits. this sucks and is bad
-// now we have a giant list of recency-biased timestamps to do what with?
-// -o dumps estimated start,end sleep schedule timestamps to stdout (default),
-// -p prints a scatter plot to file,
-// -h saves a histogram to file,
-// TODO: -s serializes and dumps raw commit timestamps to `subjects/user/snapshot-<ISO8601>`
-
 import (
 	"fmt"
 	"log"
@@ -23,15 +7,19 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/pelletier/go-toml/v2"
 )
 
+// main() calls parseSubjects which reads subjects.toml, loops over subjects to call getSubject
+// getSubject gets the sources of each subject and calls getSource, same structure for getRepo
+// cloning and commit analysis happens at the bottom in getRepo
+// main then directs control flow to output.go based on args
 
 type Source struct {
 	url   string
@@ -43,154 +31,164 @@ type Source struct {
 type Subject struct {
 	Name    string
 	Sources []Source
-}
-
-type CommitTimestamp struct {
-	Timestamp  time.Time
-	TimeOfDay  int // seconds since midnight
+	Commits map[plumbing.Hash]*object.Commit
 }
 
 const subjectsFile = "subjects.toml"
 
-func getSubjects() ([]Subject, error) {
+func parseSubjects() []Subject {
 	data, err := os.ReadFile(subjectsFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", subjectsFile, err)
+		log.Fatalf("Failed to read %s: %v", subjectsFile, err)
 	}
 
 	var raw map[string]struct {
 		Sources []string `toml:"sources"`
 	}
 	if err := toml.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal TOML: %w", err)
+		log.Fatalf("Failed to unmarshal TOML: %v", err)
 	}
 
 	var subjects []Subject
 	for name, entry := range raw {
-		subject := Subject{Name: name}
-		
-		// Parse each source URL into a Source struct
-		for _, sourceURL := range entry.Sources {
-			source, err := parseSource(sourceURL)
-			if err != nil {
-				log.Printf("Failed to parse source %s for subject %s: %v", sourceURL, name, err)
-				continue
-			}
-			subject.Sources = append(subject.Sources, *source)
-		}
+		subject := getSubject(name, entry.Sources)
 		subjects = append(subjects, subject)
 	}
-	return subjects, nil
+	return subjects
 }
 
-// creates a Source object from a url string in a toml
-func parseSource(raw string) (*Source, error) {
-	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
-		raw = "https://" + raw
+func getSubject(name string, sourceURLs []string) Subject {
+	fmt.Printf("--- Building Subject: %s ---\n", name)
+	subject := Subject{
+		Name:    name,
+		Commits: make(map[plumbing.Hash]*object.Commit),
 	}
 	
-	parsed, err := url.Parse(raw)
+	for _, sourceURL := range sourceURLs {
+		source, commits := getSource(sourceURL, name)
+		if source == nil {
+			continue
+		}
+		subject.Sources = append(subject.Sources, *source)
+		
+		// stuff these into a hashset/map so they're deduplicated in case the sources are redundant
+		for _, commit := range commits {
+			subject.Commits[commit.Hash] = commit
+		}
+	}
+	
+	fmt.Printf("Total unique commits for %s: %d\n", name, len(subject.Commits))
+	return subject
+}
+
+func getSource(rawURL string, subjectName string) (*Source, []*object.Commit) {
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		rawURL = "https://" + rawURL
+	}
+	
+	parsed, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse URL %s: %w", raw, err)
+		log.Printf("Failed to parse URL %s: %v", rawURL, err)
+		return nil, nil
 	}
 
 	host := parsed.Hostname()
 	path := strings.Trim(parsed.Path, "/")
 	
 	if path == "" {
-		return nil, fmt.Errorf("URL has no path: %s", raw)
+		log.Printf("URL has no path: %s", rawURL)
+		return nil, nil
 	}
 	
 	parts := strings.Split(path, "/")
 	user := parts[0]
 	var repoName string
-	if len(parts) >= 2 {
+	if len(parts) > 1 {
 		repoName = parts[1]
 	}
 	
-	res := &Source{
-		url:  raw,
+	source := &Source{
+		url:  rawURL,
 		host: host,
 		user: user,
 	}
-	
-	fetcher := detectAPI(host)
-	if fetcher == nil {
-		return nil, fmt.Errorf("unknown API for host %s", host)
-	}
-	
+
+	// if source is a repo and not a git user, we can just clone it.
+	// if it isn't, we have to call detectAPI to try to determine how to enumerate a user's repos
 	var repoURLs []string
 	if repoName != "" {
 		cloneURL := fmt.Sprintf("https://%s/%s/%s.git", host, user, repoName)
 		repoURLs = []string{cloneURL}
 	} else {
+		fetcher := detectAPI(host)
+		if fetcher == nil {
+			log.Printf("Unknown API for host %s", host)
+			return nil, nil
+		}
+		// a corresponding fetcher for each git host API
 		repoURLs, err = fetcher(host, user)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch repos for %s on host %s: %w", user, host, err)
+			log.Printf("Failed to fetch repos for %s on host %s: %v", user, host, err)
+			return nil, nil
 		}
 	}
 
-	// cloning step
+	fmt.Printf("Processing source: %s (%d repos)\n", rawURL, len(repoURLs))
+	
+	var allCommits []*object.Commit
 	for _, repoURL := range repoURLs {
-		repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
-			URL:        repoURL,
-			Filter:     packp.FilterBlobNone(),
-			NoCheckout: true,
-		})
-		if err != nil {
-			log.Printf("Failed to clone repository %s: %v", repoURL, err)
-			continue
+		repo, commits := getRepo(repoURL, subjectName, user)
+		if repo != nil {
+			source.repos = append(source.repos, repo)
+			allCommits = append(allCommits, commits...)
 		}
-		res.repos = append(res.repos, repo)
 	}
-	return res, nil
+	return source, allCommits
 }
 
-// extracts commit time data from all repos in a Source
-func parseRepos(source *Source, subjectName string) ([]CommitTimestamp, error) {
-	var allTimestamps []CommitTimestamp
-
-	fmt.Printf("Processing source: %s (%d repos)\n", source.url, len(source.repos))
-
-	for _, repo := range source.repos {
-		head, err := repo.Head()
-		if err != nil {
-			log.Printf("Failed to get HEAD: %v", err)
-			continue
-		}
-
-		commitIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
-		if err != nil {
-			log.Printf("Failed to get commit log: %v", err)
-			continue
-		}
-
-		var commits []CommitTimestamp
-		err = commitIter.ForEach(func(c *object.Commit) error {
-			if !isCommitFromUser(c, subjectName, source.user) {
-				return nil
-			}
-
-			t := c.Author.When
-			secondsSinceMidnight := t.Hour()*3600 + t.Minute()*60 + t.Second()
-			commits = append(commits, CommitTimestamp{
-				Timestamp: t,
-				TimeOfDay: secondsSinceMidnight,
-			})
-			return nil
-		})
-
-		if err != nil {
-			log.Printf("Failed to iterate commits: %v", err)
-			continue
-		}
-
-		fmt.Printf("Found %d commits in repo\n", len(commits))
-		allTimestamps = append(allTimestamps, commits...)
+func getRepo(repoURL string, subjectName string, sourceUser string) (*git.Repository, []*object.Commit) {
+	fmt.Printf("  Cloning metadata for repo: %s\n", repoURL)
+	
+	repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+		URL:        repoURL,
+		Filter:     packp.FilterBlobNone(),
+		NoCheckout: true,
+	})
+	if err != nil {
+		log.Printf("  Failed to clone repository %s: %v", repoURL, err)
+		return nil, nil
 	}
-	return allTimestamps, nil
+	
+	head, err := repo.Head()
+	if err != nil {
+		log.Printf("  Failed to get HEAD for %s: %v", repoURL, err)
+		return nil, nil
+	}
+
+	commitIter, err := repo.Log(&git.LogOptions{From: head.Hash()})
+	if err != nil {
+		log.Printf("  Failed to get commit log for %s: %v", repoURL, err)
+		return nil, nil
+	}
+
+	var commits []*object.Commit
+	err = commitIter.ForEach(func(c *object.Commit) error {
+		if isCommitFromUser(c, subjectName, sourceUser) {
+			commits = append(commits, c)
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("  Failed to iterate commits for %s: %v", repoURL, err)
+		return nil, nil
+	}
+
+	fmt.Printf("  Found %d commits in repo\n", len(commits))
+	return repo, commits
 }
 
+// TODO: entirely slop
 func isCommitFromUser(commit *object.Commit, subjectName string, githubUsername string) bool {
 	authorName := strings.ToLower(commit.Author.Name)
 	authorEmail := strings.ToLower(commit.Author.Email)
@@ -215,26 +213,16 @@ func isCommitFromUser(commit *object.Commit, subjectName string, githubUsername 
 	return false
 }
 
-// if someone passes `-u user@source1,source2`, quickly hack-together a Subject
-func buildSubjectFromFlag(userFlag string) (Subject, error) {
+func buildSubjectFromFlag(userFlag string) Subject {
 	parts := strings.Split(userFlag, "@")
 	if len(parts) != 2 {
-		return Subject{}, fmt.Errorf("invalid format, expected: name@url1,url2")
+		log.Fatalf("Invalid format, expected: name@url1,url2")
 	}
 	
 	name := parts[0]
 	urls := strings.Split(parts[1], ",")
 	
-	subject := Subject{Name: name}
-	for _, url := range urls {
-		source, err := parseSource(url)
-		if err != nil {
-			log.Printf("Failed to parse source %s: %v", url, err)
-			continue
-		}
-		subject.Sources = append(subject.Sources, *source)
-	}
-	return subject, nil
+	return getSubject(name, urls)
 }
 
 func main() {
@@ -245,55 +233,29 @@ func main() {
 	flag.Parse()
 
 	var subjects []Subject
-	var err error
 	
 	if *userFlag != "" {
-		subject, err := buildSubjectFromFlag(*userFlag)
-		if err != nil {
-			log.Fatalf("Error parsing user flag: %v", err)
-		}
+		subject := buildSubjectFromFlag(*userFlag)
 		subjects = []Subject{subject}
 	} else {
-		subjects, err = getSubjects()
-		if err != nil {
-			log.Fatalf("Error reading subjects: %v", err)
-		}
+		subjects = parseSubjects()
 		if len(subjects) == 0 {
 			log.Fatal("No subjects found")
 		}
 	}
 
 	for _, subject := range subjects {
-		fmt.Printf("--- Processing Subject: %s ---\n", subject.Name)
-
-		if len(subject.Sources) == 0 {
-			log.Printf("No sources found for %s. Skipping.", subject.Name)
+		if len(subject.Commits) == 0 {
+			log.Printf("No commits found for %s. Skipping output.", subject.Name)
 			continue
 		}
-
-		var allTimestamps []CommitTimestamp
-		for _, source := range subject.Sources {
-			commits, err := parseRepos(&source, subject.Name) 
-			if err != nil {
-				log.Printf("Skipping source %s: %v", source.url, err)
-				continue
-			}
-			allTimestamps = append(allTimestamps, commits...)
-		}
-
-		if len(allTimestamps) == 0 {
-			log.Printf("No commits found for %s. Skipping.", subject.Name)
-			continue
-		}
-
-		fmt.Printf("Total commits found for %s: %d\n", subject.Name, len(allTimestamps))
 
 		if *stdOut {
-			estimateSleepSchedule(allTimestamps, subject.Name)
+			estimateSleepSchedule(&subject)
 		}
 		if *plotScatter {
 			outputFilename := fmt.Sprintf("%s_commits_scatter.png", subject.Name)
-			if err := plotCommitsScatter(allTimestamps, outputFilename); err != nil {
+			if err := plotCommitsScatter(&subject, outputFilename); err != nil {
 				log.Printf("Failed to save scatter plot for %s: %v", subject.Name, err)
 			} else {
 				fmt.Printf("Saved scatter plot to %s\n", outputFilename)
@@ -301,7 +263,7 @@ func main() {
 		}
 		if *plotHisto {
 			outputFilename := fmt.Sprintf("%s_commits_histogram.png", subject.Name)
-			if err := plotCommitsHistogram(allTimestamps, outputFilename); err != nil {
+			if err := plotCommitsHistogram(&subject, outputFilename); err != nil {
 				log.Printf("Failed to save histogram for %s: %v", subject.Name, err)
 			} else {
 				fmt.Printf("Saved histogram to %s\n", outputFilename)

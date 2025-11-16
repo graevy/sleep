@@ -28,16 +28,6 @@ func detectAPI(host string) fetchFunc {
 		strings.HasSuffix(host, "codeberg.org"),
 		strings.HasSuffix(host, "forgejo.org"):
 		return fetchGiteaRepoURLs
-
-	// maybe later
-	// case strings.HasSuffix(host, "pagure.io"),
-	// 	strings.HasSuffix(host, "fedoraproject.org"),
-	// 	strings.HasSuffix(host, "freedesktop.org"):
-	// 	return fetchPagureRepoURLs
-	//
-	// case strings.HasSuffix(host, "sourcehut.org"),
-	// 	strings.HasSuffix(host, "git.sr.ht"):
-	// 	return fetchSourceHutRepoURLs
 	}
 
 	client := &http.Client{

@@ -11,22 +11,23 @@ import (
 )
 
 // estimateSleepSchedule analyzes commits to find likely sleep windows
-func estimateSleepSchedule(commits []CommitTimestamp, subjectName string) {
-	if len(commits) == 0 {
-		fmt.Printf("No commits to analyze for %s\n", subjectName)
+func estimateSleepSchedule(subject *Subject) {
+	if len(subject.Commits) == 0 {
+		fmt.Printf("No commits to analyze for %s\n", subject.Name)
 		return
 	}
 
 	// Build histogram of activity by hour
 	hourCounts := make([]int, 24)
-	for _, c := range commits {
-		hour := c.TimeOfDay / 3600
+	for _, c := range subject.Commits {
+		t := c.Author.When
+		hour := t.Hour()
 		hourCounts[hour]++
 	}
 
 	// Find the longest consecutive sequence of low-activity hours
 	// Low activity = fewer than 5% of average hourly commits
-	totalCommits := len(commits)
+	totalCommits := len(subject.Commits)
 	avgPerHour := float64(totalCommits) / 24.0
 	threshold := int(avgPerHour * 0.05)
 	if threshold < 1 {
@@ -56,31 +57,35 @@ func estimateSleepSchedule(commits []CommitTimestamp, subjectName string) {
 		sleepStart := longestStart
 		sleepEnd := (longestStart + longestLen) % 24
 		
-		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subjectName)
+		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
 		fmt.Printf("Estimated sleep window: %02d:00 - %02d:00\n", sleepStart, sleepEnd)
 		fmt.Printf("Duration: ~%d hours\n", longestLen)
 		fmt.Printf("Based on %d commits\n", totalCommits)
 		fmt.Printf("Low-activity threshold: ≤%d commits/hour\n\n", threshold)
 	} else {
-		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subjectName)
+		fmt.Printf("\n=== Sleep Schedule Estimate for %s ===\n", subject.Name)
 		fmt.Printf("Unable to identify clear sleep window (no extended low-activity period)\n")
 		fmt.Printf("This may indicate irregular sleep patterns or insufficient data\n\n")
 	}
 }
 
 // plotCommitsScatter creates a scatter plot of commit timestamps
-func plotCommitsScatter(commits []CommitTimestamp, outputPath string) error {
-	// Convert commits to plotter points
-	pts := make(plotter.XYs, len(commits))
-	for i, c := range commits {
-		pts[i].X = float64(c.Timestamp.Unix())
-		pts[i].Y = float64(c.TimeOfDay)
+func plotCommitsScatter(subject *Subject, outputPath string) error {
+	// Convert commits map to plotter points
+	pts := make(plotter.XYs, 0, len(subject.Commits))
+	for _, c := range subject.Commits {
+		t := c.Author.When
+		secondsSinceMidnight := t.Hour()*3600 + t.Minute()*60 + t.Second()
+		pts = append(pts, plotter.XY{
+			X: float64(t.Unix()),
+			Y: float64(secondsSinceMidnight),
+		})
 	}
 
 	green := color.RGBA{0x95, 0xd5, 0x50, 0xff}
 	p := plot.New()
 	p.BackgroundColor = color.RGBA{0x10, 0x10, 0x10, 0xff}
-	p.Title.Text = "Commit Schedule (Scatter)"
+	p.Title.Text = fmt.Sprintf("Commit Schedule: %s (Scatter)", subject.Name)
 	p.Title.TextStyle.Color = green
 	p.X.Label.Text = "Commit Date"
 	p.X.Label.TextStyle.Color = green
@@ -110,11 +115,12 @@ func plotCommitsScatter(commits []CommitTimestamp, outputPath string) error {
 }
 
 // plotCommitsHistogram creates a histogram of commits by hour of day
-func plotCommitsHistogram(commits []CommitTimestamp, outputPath string) error {
+func plotCommitsHistogram(subject *Subject, outputPath string) error {
 	// Count commits per hour
 	hourCounts := make([]float64, 24)
-	for _, c := range commits {
-		hour := c.TimeOfDay / 3600
+	for _, c := range subject.Commits {
+		t := c.Author.When
+		hour := t.Hour()
 		hourCounts[hour]++
 	}
 
@@ -127,7 +133,7 @@ func plotCommitsHistogram(commits []CommitTimestamp, outputPath string) error {
 	green := color.RGBA{0x95, 0xd5, 0x50, 0xff}
 	p := plot.New()
 	p.BackgroundColor = color.RGBA{0x10, 0x10, 0x10, 0xff}
-	p.Title.Text = "Commit Distribution by Hour"
+	p.Title.Text = fmt.Sprintf("Commit Distribution: %s (by Hour)", subject.Name)
 	p.Title.TextStyle.Color = green
 	p.X.Label.Text = "Hour of Day"
 	p.X.Label.TextStyle.Color = green
