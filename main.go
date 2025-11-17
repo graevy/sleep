@@ -3,10 +3,11 @@ package main
 import (
 	"fmt"
 	"log"
-	"flag"
+	"github.com/spf13/pflag"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -17,9 +18,15 @@ import (
 )
 
 // main() calls parseSubjects which reads subjects.toml, loops over subjects to call getSubject
-// getSubject gets the sources of each subject and calls getSource, same structure for getRepo
-// cloning and commit analysis happens at the bottom in getRepo
+// getSubject gets the sources of each subject and calls getSource.
+// since sources can have multiple repos (e.g. "github.com/you/"), find the appropriate git API in api.go
+// then get the repos of that user from the API, and call getRepo for each
+// getRepo does the actual soft-cloning and commit analysis
 // main then directs control flow to output.go based on args
+
+// some git APIs (github/gitlab?) support a /events endpoint; recent account activity
+// i've had a lot of trouble getting these APIs to give me more than ~50 events. also they throttle
+// so, just sticking to cloning for now. rearchitecting would probably give more useful data
 
 type Source struct {
 	url   string
@@ -31,10 +38,12 @@ type Source struct {
 type Subject struct {
 	Name    string
 	Sources []Source
+	// stuff these into a hashset/map so they're deduplicated in case the sources are redundant
 	Commits map[plumbing.Hash]*object.Commit
 }
 
 const subjectsFile = "subjects.toml"
+const savePath = "snapshots"
 
 func parseSubjects() []Subject {
 	data, err := os.ReadFile(subjectsFile)
@@ -71,7 +80,6 @@ func getSubject(name string, sourceURLs []string) Subject {
 		}
 		subject.Sources = append(subject.Sources, *source)
 		
-		// stuff these into a hashset/map so they're deduplicated in case the sources are redundant
 		for _, commit := range commits {
 			subject.Commits[commit.Hash] = commit
 		}
@@ -126,7 +134,7 @@ func getSource(rawURL string, subjectName string) (*Source, []*object.Commit) {
 			return nil, nil
 		}
 		// a corresponding fetcher for each git host API
-		repoURLs, err = fetcher(host, user)
+		repoURLs, err = fetcher(host, user, flags)
 		if err != nil {
 			log.Printf("Failed to fetch repos for %s on host %s: %v", user, host, err)
 			return nil, nil
@@ -171,7 +179,7 @@ func getRepo(repoURL string, subjectName string, sourceUser string) (*git.Reposi
 
 	var commits []*object.Commit
 	err = commitIter.ForEach(func(c *object.Commit) error {
-		if isCommitFromUser(c, subjectName, sourceUser) {
+		if validateCommit(c, subjectName, sourceUser) {
 			commits = append(commits, c)
 		}
 		return nil
@@ -186,8 +194,15 @@ func getRepo(repoURL string, subjectName string, sourceUser string) (*git.Reposi
 	return repo, commits
 }
 
-// TODO: entirely slop
-func isCommitFromUser(commit *object.Commit, subjectName string, githubUsername string) bool {
+// i am already filtering old repos (last-pushed-at) via APIs, but not old commits
+// anything older than 1 month gets thrown out
+func validateCommit(commit *object.Commit, subjectName string, githubUsername string) bool {
+
+	if !commit.Committer.When.After(flags.Since) {
+		return false
+	}
+
+	// TODO: slop ahead
 	authorName := strings.ToLower(commit.Author.Name)
 	authorEmail := strings.ToLower(commit.Author.Email)
 	
@@ -223,16 +238,30 @@ func buildSubjectFromFlag(userFlag string) Subject {
 	return getSubject(name, urls)
 }
 
+type Flags struct {
+	User			string
+	Since			time.Time
+	Write			bool
+	StdOut		bool
+	PlotScatter bool
+	PlotHisto	bool
+} 
+var flags Flags
+
 func main() {
-	userFlag := flag.String("u", "", "manually supply e.g. user@source1,source2,source3")
-	stdOut := flag.Bool("o", true, "output sleep schedule estimate")
-	plotScatter := flag.Bool("p", false, "generate scatter plot")
-	plotHisto := flag.Bool("h", false, "generate histogram")
-	flag.Parse()
+	pflag.StringVarP(&flags.User, "user", "u", "", "manually supply e.g. user@source1,source2,source3")
+	var age int
+	pflag.IntVarP(&age, "since", "s", 90, "how many days ago to begin tracking (default 90)")
+	pflag.BoolVarP(&flags.Write, "write", "w", true, "write snapshot to disk")
+	pflag.BoolVarP(&flags.StdOut, "stdout", "o", true, "output sleep schedule estimate")
+	pflag.BoolVarP(&flags.PlotScatter, "plot-scatter", "p", false, "generate scatter plot")
+	pflag.BoolVarP(&flags.PlotHisto, "plot-histo", "h", false, "generate histogram")
+	pflag.Parse()
+	flags.Since = time.Now().AddDate(0, 0, -age)
 
 	var subjects []Subject
-	if *userFlag != "" {
-		subject := buildSubjectFromFlag(*userFlag)
+	if flags.User != "" {
+		subject := buildSubjectFromFlag(flags.User)
 		subjects = []Subject{subject}
 	} else {
 		subjects = parseSubjects()
@@ -240,6 +269,6 @@ func main() {
 			log.Fatal("No subjects found")
 		}
 	}
-	output(subjects, *stdOut, *plotScatter, *plotHisto)
+	output(subjects, flags)
 }
 

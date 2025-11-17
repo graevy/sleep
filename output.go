@@ -6,13 +6,17 @@ import (
 	"time"
 	"log"
 	"strings"
+	"path/filepath"
+	"os"
+
+	"github.com/pelletier/go-toml/v2"
 
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
 )
 
-func output(subjects []Subject, o bool, p bool, h bool) {
+func output(subjects []Subject, flags Flags) {
 	if len(subjects) == 0 {
 		log.Fatal("No subjects found")
 	}
@@ -23,12 +27,12 @@ func output(subjects []Subject, o bool, p bool, h bool) {
 			continue
 		}
 
-		if o {
+		if flags.StdOut {
 			if err := printSleepHisto(&subject); err != nil {
 				log.Printf("Failed to print sleep histogram for %s: %v", subject.Name, err)
 			}
 		}
-		if p {
+		if flags.PlotScatter {
 			outputFilename := fmt.Sprintf("%s_commits_scatter.png", subject.Name)
 			if err := plotCommitsScatter(&subject, outputFilename); err != nil {
 				log.Printf("Failed to save scatter plot for %s: %v", subject.Name, err)
@@ -36,7 +40,7 @@ func output(subjects []Subject, o bool, p bool, h bool) {
 				fmt.Printf("Saved scatter plot to %s\n", outputFilename)
 			}
 		}
-		if h {
+		if flags.PlotHisto {
 			outputFilename := fmt.Sprintf("%s_commits_histogram.png", subject.Name)
 			if err := plotCommitsHistogram(&subject, outputFilename); err != nil {
 				log.Printf("Failed to save histogram for %s: %v", subject.Name, err)
@@ -44,7 +48,6 @@ func output(subjects []Subject, o bool, p bool, h bool) {
 				fmt.Printf("Saved histogram to %s\n", outputFilename)
 			}
 		}
-		log.Println("--------------------------------")
 	}
 }
 
@@ -60,14 +63,33 @@ func printSleepHisto(subject *Subject) error {
 		}
 	}
 
-	n := len(fmt.Sprintf("%d", maxi))
+	// 0-pad according to the # of digits in max value
+	width := len(fmt.Sprintf("%d", maxi))
+
 	log.Printf("Sleep histogram for user %s:\n", subject.Name)
-	for hour, count := range hourCounts {
-		fmt.Printf("%02d:00 (%0*d): %s\n", hour, n, count, strings.Repeat("#", count))
+
+	// assumed terminal width of 80
+	if maxi > 80 {
+		scalingFactor := float64(80) / float64(maxi)
+		for hour, count := range hourCounts {
+			hashtags := strings.Repeat("#", int(float64(count) * scalingFactor))
+			fmt.Printf("%02d:00 (%0*d): %s\n", hour, width, count, hashtags)
+		}
+	} else {
+		for hour, count := range hourCounts {
+			hashtags := strings.Repeat("#", count)
+			fmt.Printf("%02d:00 (%0*d): %s\n", hour, width, count, hashtags)
+		}
 	}
+
+	if flags.Write {
+		save(subject, hourCounts)
+	}
+
 	return nil
 }
 
+// TODO: slop
 // plotCommitsScatter creates a scatter plot of commit timestamps
 func plotCommitsScatter(subject *Subject, outputPath string) error {
 	// Convert commits map to plotter points
@@ -103,8 +125,8 @@ func plotCommitsScatter(subject *Subject, outputPath string) error {
 	if err != nil {
 		return fmt.Errorf("could not create scatter plot: %v", err)
 	}
-	scatter.GlyphStyle.Radius = vg.Points(2)
-	scatter.GlyphStyle.Color = green
+	scatter.Radius = vg.Points(2)
+	scatter.Color = green
 	p.Add(scatter)
 	
 	if err := p.Save(10*vg.Inch, 6*vg.Inch, outputPath); err != nil {
@@ -113,6 +135,7 @@ func plotCommitsScatter(subject *Subject, outputPath string) error {
 	return nil
 }
 
+// TODO: slop
 // plotCommitsHistogram creates a histogram of commits by hour of day
 func plotCommitsHistogram(subject *Subject, outputPath string) error {
 	// Count commits per hour
@@ -125,7 +148,7 @@ func plotCommitsHistogram(subject *Subject, outputPath string) error {
 
 	// Create bar chart values
 	values := make(plotter.Values, 24)
-	for i := 0; i < 24; i++ {
+	for i  := range 24 {
 		values[i] = hourCounts[i]
 	}
 
@@ -201,8 +224,45 @@ func (dateTicks) Ticks(min, max float64) []plot.Tick {
 	return ticks
 }
 
-// analyzes commits to find likely sleep windows
-// pretty clumsy, might remove
+func save(subject *Subject, times []int) {
+	stamp := time.Now().UTC().Format("2006-01-02") + ".toml"
+	path := filepath.Join(savePath, stamp)
+
+	err := os.MkdirAll(filepath.Dir(path), 0o755)
+	if err != nil {
+		log.Fatalf("could not make dir(s) %s: %v", filepath.Dir(path), err)
+	}
+
+	f, err := os.Create(path)
+	if err != nil {
+		log.Fatalf("could not write file %s: %v", path, err)
+	}
+	defer f.Close()
+
+	mappedTimes := map[string][]int{
+		subject.Name: times,
+	}
+
+	if err := toml.NewEncoder(f).Encode(mappedTimes); err != nil {
+		log.Fatalf("encode %s: %v", path, err)
+	}	
+}
+
+// maybe
+// func serialize(subject *Subject) {
+// 	stamp := time.Now().UTC().Format("2006-01-02_15-04-05")
+// 	path := filepath.Join(savePath, subject.Name, stamp)
+//
+// 	fs := osfs.New(path)
+// 	store := filesystem.NewStorage(fs)
+//
+// 	for _, commit := range subject.Commits {
+// 		
+// 	}
+// }
+
+// find likely sleep windows
+// too many assumptions i think
 // func estimateSleepSchedule(subject *Subject) {
 // 	if len(subject.Commits) == 0 {
 // 		fmt.Printf("No commits to analyze for %s\n", subject.Name)

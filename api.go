@@ -11,7 +11,7 @@ import (
 	"net/http"
 )
 
-type fetchFunc func(host, user string) ([]string, error)
+type fetchFunc func(host, user string, flags Flags) ([]string, error)
 
 func detectAPI(host string) fetchFunc {
 	host = strings.ToLower(host)
@@ -62,10 +62,10 @@ func detectAPI(host string) fetchFunc {
 	}
 }
 
-func fetchGitHubRepoURLs(host string, username string) ([]string, error) {
+// TODO: github does expose an events API to get recent events, awkward to fit into the architecture though
+func fetchGitHubRepoURLs(host string, username string, flags Flags) ([]string, error) {
 	log.Printf("matched host %s to github API, attempting to fetch repos...", host)
 
-	// apiURL := fmt.Sprintf("https://api.github.com/users/%s/repos?per_page=100", username)
 	apiURL := fmt.Sprintf("https://api.github.com/users/%s/repos?type=public&sort=pushed&direction=desc&per_page=100", username)
 
 	req, err := http.NewRequest("GET", apiURL, nil)
@@ -97,6 +97,7 @@ func fetchGitHubRepoURLs(host string, username string) ([]string, error) {
 
 	var repos []struct {
 		CloneURL string `json:"clone_url"`
+		UpdatedAt string `json:"updated_at"`
 	}
 
 	if err := json.Unmarshal(body, &repos); err != nil {
@@ -105,12 +106,18 @@ func fetchGitHubRepoURLs(host string, username string) ([]string, error) {
 
 	var urls []string
 	for _, repo := range repos {
-		urls = append(urls, repo.CloneURL)
+		t, err := time.Parse(time.RFC3339, repo.UpdatedAt)
+		if err != nil {
+			fmt.Errorf("failed to parse time %s via RFC3339", repo.UpdatedAt)
+		} else if t.After(flags.Since) {
+			urls = append(urls, repo.CloneURL)
+		}
 	}
 	return urls, nil
 }
 
-func fetchGitLabRepoURLs(host, username string) ([]string, error) {
+// TODO: untested
+func fetchGitLabRepoURLs(host, username string, flags Flags) ([]string, error) {
 	log.Printf("matched host %s to gitlab API, attempting to fetch repos...", host)
 
 	var apiBase string
@@ -123,7 +130,7 @@ func fetchGitLabRepoURLs(host, username string) ([]string, error) {
 		return nil, fmt.Errorf("unsupported GitLab/Gitea host: %s", host)
 	}
 
-	apiURL := apiBase + "?order_by=last_activity_at&sort=desc&per_page=100&per_page=100"
+	apiURL := apiBase + "?order_by=last_activity_at&sort=desc&per_page=100"
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -175,7 +182,7 @@ func fetchGitLabRepoURLs(host, username string) ([]string, error) {
 	return urls, nil
 }
 
-func fetchGiteaRepoURLs(host, username string) ([]string, error) {
+func fetchGiteaRepoURLs(host, username string, flags Flags) ([]string, error) {
 	log.Printf("matched host %s to gitea API, attempting to fetch repos...", host)
 
 	apiURL := fmt.Sprintf("https://%s/api/v1/users/%s/repos?sort=updated&limit=100", host, username)
